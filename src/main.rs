@@ -2,10 +2,52 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
+use std::net::{TcpListener, TcpStream};
 
 struct MinkDB {
     datafile: File,
     index: HashMap<String, u64>,
+}
+
+fn handle_client(stream: TcpStream, db: &mut MinkDB) -> io::Result<()> {
+    let mut reader = BufReader::new(&stream);
+    let mut writer = &stream;
+
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line)?;
+
+        if bytes == 0 {
+            break; // client disconnected, yeah? are you sure?
+        }
+
+        let command = match parse_command(&line) {
+            Ok(command) => command,
+            Err(e) => {
+                writeln!(writer, "ERR: {}", e)?;
+                continue;
+            }
+        };
+
+        match command.operation.as_str() {
+            "put" => {
+                db.handle_put(&command)?;
+                writeln!(writer, "OK")?;
+            }
+
+            "get" => match db.handle_get(&command) {
+                Ok(Some(value)) => writeln!(writer, "{}", value)?,
+                Ok(None) => writeln!(writer, "Key not found")?,
+                Err(e) => writeln!(writer, "Error {}", e)?,
+            },
+
+            _ => {
+                writeln!(writer, "Unknown command {}", command.operation)?;
+            }
+        };
+    }
+
+    Ok(())
 }
 
 impl MinkDB {
@@ -70,7 +112,7 @@ impl MinkDB {
         Ok(())
     }
 
-    fn handle_get(&mut self, command: &Command) -> io::Result<()> {
+    fn handle_get(&mut self, command: &Command) -> io::Result<Option<String>> {
         let key = &command.arguments[0];
 
         match self.index.get(key) {
@@ -85,17 +127,14 @@ impl MinkDB {
                 let mut parts = line.split_whitespace();
                 parts.next();
 
-                if let Some(value) = parts.next() {
-                    println!("Value: {}", value);
+                match parts.next() {
+                    Some(value) => Ok(Some(value.to_string())),
+                    None => Ok(None),
                 }
             }
 
-            None => {
-                println!("Key not found");
-            }
+            None => Ok(None),
         }
-
-        Ok(())
     }
 }
 
@@ -163,7 +202,6 @@ fn handle_get(command: &Command, datafile: &mut File) -> std::io::Result<()> {
 
 fn main() {
     println!("MinkDB starting...");
-    println!("Attempting to open data file");
 
     let mut db = match MinkDB::new("data.db") {
         Ok(db) => {
@@ -177,28 +215,9 @@ fn main() {
         }
     };
 
-    let stdin = io::stdin();
-    let input = &mut String::new();
+    let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
 
-    loop {
-        input.clear();
-        stdin.read_line(input);
-
-        let command = match parse_command(input) {
-            Ok(command) => command,
-            Err(e) => {
-                println!("Error: {}", e);
-                continue;
-            }
-        };
-
-        match command.operation.as_str() {
-            "put" => db.handle_put(&command),
-            "get" => db.handle_get(&command),
-            _ => {
-                println!("Invalid operaiton {}", command.operation);
-                Ok(())
-            }
-        };
+    for stream in listener.incoming() {
+        handle_client(stream.unwrap(), &mut db);
     }
 }
